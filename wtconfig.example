@@ -1,0 +1,4 @@
+# wt 多仓库 worktree 管理器配置
+WT_ROOT=$HOME/wt                    # worktree 存放根目录
+WT_UMES3=$HOME/projects/UMES3       # 前端仓库
+WT_FA56=$HOME/projects/fa56-php     # 后端仓库

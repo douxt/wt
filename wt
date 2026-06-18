@@ -1,0 +1,289 @@
+#!/bin/bash
+set -euo pipefail
+trap 'rm -f /tmp/wt-*.lock 2>/dev/null' EXIT
+
+# ── Config ──────────────────────────────────────────────
+load_config() {
+  local cfg="$HOME/.wtconfig"
+  [ -f "$cfg" ] || { echo "❌ 未找到 $cfg，请先创建配置"; exit 1; }
+  source "$cfg"
+  [ -z "${WT_ROOT:-}" ] && { echo "❌ WT_ROOT 未配置"; exit 1; }
+  [ -z "${WT_UMES3:-}" ] && { echo "❌ WT_UMES3 未配置"; exit 1; }
+  [ -z "${WT_FA56:-}" ] && { echo "❌ WT_FA56 未配置"; exit 1; }
+  [ -d "$WT_UMES3/.git" ] || { echo "❌ 仓库不存在: $WT_UMES3"; exit 1; }
+  [ -d "$WT_FA56/.git" ] || { echo "❌ 仓库不存在: $WT_FA56"; exit 1; }
+}
+
+base_branch() {
+  local repo=$1
+  git -C "$repo" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null \
+    | sed 's|refs/remotes/origin/||' || echo "main"
+}
+
+worktree_path() { echo "$WT_ROOT/$1"; }
+
+# ── Helpers ──────────────────────────────────────────────
+repo_status() {
+  local repo=$1 name=$2
+  local dir="$WT_ROOT/$name/$(basename "$repo")"
+  [ -d "$dir" ] || { echo "missing"; return; }
+  local branch
+  branch=$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "detached")
+  if [ "$branch" = "detached" ]; then echo "detached"; return; fi
+  local base
+  base=$(base_branch "$repo")
+  git -C "$dir" diff --quiet 2>/dev/null || { echo "dirty"; return; }
+  local behind
+  behind=$(git -C "$dir" rev-list "HEAD..origin/$base" --count 2>/dev/null || echo 0)
+  local ahead
+  ahead=$(git -C "$dir" rev-list "origin/$base..HEAD" --count 2>/dev/null || echo 0)
+  if [ "$ahead" -gt 0 ] && [ "$behind" -eq 0 ]; then echo "ahead"; return; fi
+  if [ "$behind" -gt 0 ]; then echo "behind"; return; fi
+  git -C "$dir" branch --merged "origin/$base" 2>/dev/null | grep -q "^\*\| $branch$" \
+    && { echo "merged"; return; }
+  echo "clean"
+}
+
+git_precheck() {
+  local dir=$1 label=$2
+  [ -d "$dir" ] || { echo "❌ $label worktree 不存在: $dir"; exit 1; }
+  local status
+  status=$(cd "$dir" && git status --porcelain 2>/dev/null | head -1)
+  [ -n "$status" ] && echo "⚠️  $label 有未提交改动" || true
+}
+
+context_write() {
+  local name=$1 desc=${2:-}
+  cat > "$WT_ROOT/$name/CONTEXT.md" <<-EOF
+# 任务: $name
+- 创建时间: $(date +%Y-%m-%d)
+- 前端: ./UMES3 → 分支 $name
+- 后端: ./fa56-php → 分支 $name
+EOF
+  [ -n "$desc" ] && echo "- 描述: $desc" >> "$WT_ROOT/$name/CONTEXT.md"
+}
+
+# ── Commands ─────────────────────────────────────────────
+cmd_create() {
+  local name=$1 desc=${2:-}
+  local dir
+  dir=$(worktree_path "$name")
+  [ -d "$dir" ] && { echo "❌ 任务 $name 已存在: $dir"; exit 1; }
+  [ -d "$WT_UMES3/.git/worktrees/$name" ] && { echo "❌ 前端已有同名 worktree"; exit 1; }
+  [ -d "$WT_FA56/.git/worktrees/$name" ] && { echo "❌ 后端已有同名 worktree"; exit 1; }
+  mkdir -p "$dir"
+  git -C "$WT_UMES3" worktree add "$dir/UMES3" -b "$name" "$(base_branch "$WT_UMES3")" 2>&1 \
+    | sed 's/^/   前端: /'
+  git -C "$WT_FA56" worktree add "$dir/fa56-php" -b "$name" "$(base_branch "$WT_FA56")" 2>&1 \
+    | sed 's/^/   后端: /'
+  context_write "$name" "$desc"
+  echo "✅ 任务 $name 已创建"
+  echo "   cd $dir/UMES3 && claude -w $name"
+}
+
+cmd_list() {
+  local dir
+  dir=$(worktree_path "")
+  [ -d "$dir" ] || { echo "暂无任务"; return; }
+  printf "%-25s %-12s %-10s %-10s\n" "任务名" "创建时间" "UMES3" "fa56-php"
+  printf "%-25s %-12s %-10s %-10s\n" "───────" "────────" "─────" "──────"
+  for task in "$dir"/*/; do
+    local name
+    name=$(basename "$task")
+    local ctime
+    ctime=$(head -2 "$task/CONTEXT.md" 2>/dev/null | grep "创建时间" | sed 's/.*: //')
+    ctime=${ctime:-"-"}
+    local s1 s2
+    s1=$(repo_status "$WT_UMES3" "$name")
+    s2=$(repo_status "$WT_FA56" "$name")
+    printf "%-25s %-12s %-10s %-10s\n" "$name" "$ctime" "$s1" "$s2"
+  done
+}
+
+cmd_status() {
+  local name=$1 dir
+  dir=$(worktree_path "$name")
+  [ -d "$dir" ] || { echo "❌ 任务 $name 不存在"; exit 1; }
+  for pair in "UMES3 $WT_UMES3" "fa56-php $WT_FA56"; do
+    local label repo
+    read -r label repo <<< "$pair"
+    echo "─── $label ───"
+    local wd="$dir/$label"
+    if [ ! -d "$wd" ]; then
+      echo "   worktree 不存在"
+    else
+      git -C "$wd" status --short 2>/dev/null | sed 's/^/  /'
+      local ahead behind base
+      base=$(base_branch "$repo")
+      behind=$(git -C "$wd" rev-list "HEAD..origin/$base" --count 2>/dev/null || echo 0)
+      ahead=$(git -C "$wd" rev-list "origin/$base..HEAD" --count 2>/dev/null || echo 0)
+      echo "   分支: $(git -C "$wd" rev-parse --abbrev-ref HEAD)  |  落后: $behind  领先: $ahead"
+    fi
+  done
+}
+
+cmd_commit() {
+  local name=$1 msg=$2; shift 2
+  local no_push=false amend=false
+  for arg in "$@"; do
+    [ "$arg" = "--no-push" ] && no_push=true
+    [ "$arg" = "--amend" ] && amend=true
+  done
+  local dir
+  dir=$(worktree_path "$name")
+  [ -d "$dir" ] || { echo "❌ 任务 $name 不存在"; exit 1; }
+  for pair in "UMES3 $WT_UMES3" "fa56-php $WT_FA56"; do
+    local label repo
+    read -r label repo <<< "$pair"
+    local wd="$dir/$label"
+    [ ! -d "$wd" ] && { echo "⚠️  $label worktree 不存在，跳过"; continue; }
+    local has_changes
+    has_changes=$(cd "$wd" && git status --porcelain 2>/dev/null | head -1)
+    [ -z "$has_changes" ] && { echo "ℹ️  $label 无改动，跳过"; continue; }
+    local amend_flag=""
+    $amend && amend_flag="--amend"
+    (cd "$wd" && git add . && git commit ${amend_flag:+"$amend_flag"} -m "$msg") 2>&1 | sed "s/^/   $label: /"
+    if ! $no_push; then
+      (cd "$wd" && git push origin "$(git rev-parse --abbrev-ref HEAD)") 2>&1 \
+        | sed "s/^/   $label push: /" || echo "⚠️  $label push 失败"
+    fi
+  done
+  echo "✅ 提交完成"
+}
+
+cmd_rebase() {
+  local name=$1 dir
+  dir=$(worktree_path "$name")
+  [ -d "$dir" ] || { echo "❌ 任务 $name 不存在"; exit 1; }
+  for pair in "UMES3 $WT_UMES3" "fa56-php $WT_FA56"; do
+    local label repo
+    read -r label repo <<< "$pair"
+    local wd="$dir/$label"
+    [ ! -d "$wd" ] && { echo "⚠️  $label worktree 不存在，跳过"; continue; }
+    local base
+    base=$(base_branch "$repo")
+    (cd "$wd" \
+      && git stash push -m "wt-auto-$(date +%s)" 2>/dev/null || true \
+      && git fetch origin 2>&1 \
+      && git rebase "origin/$base" 2>&1 \
+      && git stash pop 2>/dev/null || true) | sed "s/^/   $label: /" || {
+        echo "❌ $label rebase 冲突，请手动处理"; exit 1
+      }
+  done
+  echo "✅ rebase 完成"
+}
+
+cmd_cleanup() {
+  local name=$1; shift
+  local force=false
+  for arg in "$@"; do [ "$arg" = "--force" ] && force=true; done
+  local dir
+  dir=$(worktree_path "$name")
+  [ -d "$dir" ] || { echo "❌ 任务 $name 不存在"; exit 1; }
+  for pair in "UMES3 $WT_UMES3" "fa56-php $WT_FA56"; do
+    local label repo
+    read -r label repo <<< "$pair"
+    local wd="$dir/$label"
+    [ ! -d "$wd" ] && { echo "⚠️  $label worktree 不存在，跳过"; continue; }
+    if ! $force; then
+      local branch
+      branch=$(git -C "$wd" rev-parse --abbrev-ref HEAD 2>/dev/null || true)
+      local base
+      base=$(base_branch "$repo")
+      local merged
+      merged=$(git -C "$repo" branch --merged "origin/$base" 2>/dev/null \
+        | grep -q "^\*\| $branch$" && echo true || echo false)
+      local pushed
+      pushed=$(git -C "$wd" rev-list "origin/$branch..HEAD" --count 2>/dev/null || echo 1)
+      [ "$merged" != "true" ] && { echo "❌ $label 分支未合并，用 --force 跳过检查"; exit 1; }
+      [ "$pushed" -gt 0 ] && { echo "❌ $label 有未推送提交，用 --force 跳过检查"; exit 1; }
+    fi
+    git -C "$repo" worktree remove "$wd" 2>&1 | sed "s/^/   $label: /" || {
+      echo "⚠️  $label worktree remove 失败，尝试 git branch -D"
+      local branch
+      branch=$(git -C "$wd" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+      [ -n "$branch" ] && git -C "$repo" branch -D "$branch" 2>/dev/null || true
+    }
+  done
+  rm -f "$dir/CONTEXT.md"
+  rmdir "$dir" 2>/dev/null || echo "⚠️  目录 $dir 未完全清空，请手动检查"
+  echo "✅ 清理完成"
+}
+
+cmd_doctor() {
+  local dir
+  dir=$(worktree_path "")
+  [ -d "$dir" ] || { echo "✅ 无残留任务"; return; }
+  local found=false
+  for task in "$dir"/*/; do
+    local name
+    name=$(basename "$task")
+    local issues=()
+    [ ! -f "$task/CONTEXT.md" ] && issues+=("缺 CONTEXT.md")
+    [ ! -d "$task/UMES3" ] && issues+=("前端 worktree 缺失")
+    [ ! -d "$task/fa56-php" ] && issues+=("后端 worktree 缺失")
+    if [ -d "$task/UMES3" ]; then
+      local branch
+      branch=$(git -C "$task/UMES3" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "detached")
+      local base
+      base=$(base_branch "$WT_UMES3")
+      local merged
+      merged=$(git -C "$WT_UMES3" branch --merged "origin/$base" 2>/dev/null \
+        | grep -q "^\*\| $branch$" && echo true || echo false)
+      [ "$merged" = "true" ] && issues+=("前端分支已合并，可清理")
+    fi
+    if [ ${#issues[@]} -gt 0 ]; then
+      found=true
+      echo "─── $name ───"
+      for i in "${issues[@]}"; do echo "   ⚠️  $i"; done
+    fi
+  done
+  $found || echo "✅ 无异常"
+}
+
+# ── Dispatch ─────────────────────────────────────────────
+usage() {
+  echo "用法: wt <命令> [参数]"
+  echo ""
+  echo "命令:"
+  echo "  create <name> [-m <描述>]   创建跨仓库 worktree"
+  echo "  list                         列出活跃任务"
+  echo "  status <name>                查看两仓库状态"
+  echo "  commit <name> <msg> [选项]   提交+推送"
+  echo "                               选项: --no-push, --amend"
+  echo "  rebase <name>                两仓库 rebase 主分支"
+  echo "  cleanup <name> [--force]     清理 worktree"
+  echo "  doctor                       检查残留 worktree"
+}
+
+load_config
+[ $# -lt 1 ] && { usage; exit 1; }
+
+case "${1:-}" in
+  create)
+    name="${2:-}"; [ -z "$name" ] && { echo "需要任务名"; exit 1; }
+    desc=""; [ "${3:-}" = "-m" ] && desc="${4:-}"
+    cmd_create "$name" "$desc"
+    ;;
+  list) cmd_list ;;
+  status)
+    name="${2:-}"; [ -z "$name" ] && { echo "需要任务名"; exit 1; }
+    cmd_status "$name"
+    ;;
+  commit)
+    name="${2:-}"; msg="${3:-}"
+    [ -z "$name" ] && { echo "需要任务名"; exit 1; }
+    [ -z "$msg" ] && { echo "需要提交信息"; exit 1; }
+    shift 3; cmd_commit "$name" "$msg" "$@"
+    ;;
+  rebase)
+    name="${2:-}"; [ -z "$name" ] && { echo "需要任务名"; exit 1; }
+    cmd_rebase "$name"
+    ;;
+  cleanup)
+    name="${2:-}"; [ -z "$name" ] && { echo "需要任务名"; exit 1; }
+    shift 2; cmd_cleanup "$name" "$@"
+    ;;
+  doctor) cmd_doctor ;;
+  *) usage; exit 1 ;;
+esac
