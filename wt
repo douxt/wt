@@ -1,17 +1,19 @@
 #!/bin/bash
 set -euo pipefail
+export WT_ACTIVE=1
 trap 'rm -f /tmp/wt-*.lock 2>/dev/null' EXIT
+
+# ── Global state (set by resolve_project) ──
+PROJECT_NAME=""
+PROJECT_DIR=""
+REPOS=()
 
 # ── Config ──────────────────────────────────────────────
 load_config() {
   local cfg="$HOME/.wtconfig"
   [ -f "$cfg" ] || { echo "❌ 未找到 $cfg，请先创建配置"; exit 1; }
   source "$cfg"
-  [ -z "${WT_ROOT:-}" ] && { echo "❌ WT_ROOT 未配置"; exit 1; }
-  [ -z "${WT_UMES3:-}" ] && { echo "❌ WT_UMES3 未配置"; exit 1; }
-  [ -z "${WT_FA56:-}" ] && { echo "❌ WT_FA56 未配置"; exit 1; }
-  [ -d "$WT_UMES3/.git" ] || { echo "❌ 仓库不存在: $WT_UMES3"; exit 1; }
-  [ -d "$WT_FA56/.git" ] || { echo "❌ 仓库不存在: $WT_FA56"; exit 1; }
+  [ -n "${WT_ROOT:-}" ] || { echo "❌ WT_ROOT 未配置"; exit 1; }
 }
 
 base_branch() {
@@ -20,12 +22,54 @@ base_branch() {
     | sed 's|refs/remotes/origin/||' || echo "main"
 }
 
-worktree_path() { echo "$WT_ROOT/$1"; }
+# ── Project resolution ─────────────────────────────────
+# .wtrepos 文件格式：每行一个仓库绝对路径，# 开头为注释，空行跳过
+resolve_project() {
+  local dir="${PROJECT_FLAG:-}"
+  if [ -z "$dir" ]; then
+    dir="$PWD"
+    while [ "$dir" != "/" ]; do
+      [ -f "$dir/.wtrepos" ] && break
+      dir="$(dirname "$dir")"
+    done
+    [ "$dir" = "/" ] && { echo "❌ 未找到 .wtrepos，请在项目目录内执行或用 -p <项目目录> 指定"; exit 1; }
+  fi
+  dir="$(cd "$dir" && pwd -P)"
+
+  PROJECT_DIR="$dir"
+  PROJECT_NAME="$(basename "$dir")"
+
+  REPOS=()
+  while IFS= read -r raw || [ -n "$raw" ]; do
+    line="$(echo "$raw" | sed 's/#.*//; s/^[[:space:]]*//; s/[[:space:]]*$//')"
+    [ -z "$line" ] && continue
+    [ -d "$line/.git" ] || { echo "❌ 仓库不存在或不是 git 仓库: $line"; exit 1; }
+    REPOS+=("$(basename "$line")	$line")
+  done < "$dir/.wtrepos"
+  [ ${#REPOS[@]} -gt 0 ] || { echo "❌ $dir/.wtrepos 为空"; exit 1; }
+}
+
+worktree_path() { echo "$WT_ROOT/$PROJECT_NAME/$1"; }
+
+# ── Context file ────────────────────────────────────────
+context_write() {
+  local name=$1 desc=${2:-}
+  cat > "$(worktree_path "$name")/CONTEXT.md" <<-EOF
+# 任务: $name
+- 项目: $PROJECT_NAME
+- 创建时间: $(date +%Y-%m-%d)
+EOF
+  for entry in "${REPOS[@]}"; do
+    local label="${entry%%	*}"
+    echo "- $label: ./$label → 分支 $name" >> "$(worktree_path "$name")/CONTEXT.md"
+  done
+  [ -z "$desc" ] || echo "- 描述: $desc" >> "$(worktree_path "$name")/CONTEXT.md"
+}
 
 # ── Helpers ──────────────────────────────────────────────
 repo_status() {
-  local repo=$1 name=$2
-  local dir="$WT_ROOT/$name/$(basename "$repo")"
+  local project=$1 name=$2 repo=$3
+  local dir="$WT_ROOT/$project/$name/$(basename "$repo")"
   [ -d "$dir" ] || { echo "missing"; return; }
   local branch
   branch=$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "detached")
@@ -44,69 +88,59 @@ repo_status() {
   echo "clean"
 }
 
-git_precheck() {
-  local dir=$1 label=$2
-  [ -d "$dir" ] || { echo "❌ $label worktree 不存在: $dir"; exit 1; }
-  local status
-  status=$(cd "$dir" && git status --porcelain 2>/dev/null | head -1)
-  [ -n "$status" ] && echo "⚠️  $label 有未提交改动" || true
-}
-
-context_write() {
-  local name=$1 desc=${2:-}
-  cat > "$WT_ROOT/$name/CONTEXT.md" <<-EOF
-# 任务: $name
-- 创建时间: $(date +%Y-%m-%d)
-- 前端: ./UMES3 → 分支 $name
-- 后端: ./fa56-php → 分支 $name
-EOF
-  [ -n "$desc" ] && echo "- 描述: $desc" >> "$WT_ROOT/$name/CONTEXT.md"
-}
-
 # ── Commands ─────────────────────────────────────────────
 cmd_create() {
   local name=$1 desc=${2:-}
+  resolve_project
   local dir
   dir=$(worktree_path "$name")
   [ -d "$dir" ] && { echo "❌ 任务 $name 已存在: $dir"; exit 1; }
-  [ -d "$WT_UMES3/.git/worktrees/$name" ] && { echo "❌ 前端已有同名 worktree"; exit 1; }
-  [ -d "$WT_FA56/.git/worktrees/$name" ] && { echo "❌ 后端已有同名 worktree"; exit 1; }
   mkdir -p "$dir"
-  git -C "$WT_UMES3" worktree add "$dir/UMES3" -b "$name" "$(base_branch "$WT_UMES3")" 2>&1 \
-    | sed 's/^/   前端: /'
-  git -C "$WT_FA56" worktree add "$dir/fa56-php" -b "$name" "$(base_branch "$WT_FA56")" 2>&1 \
-    | sed 's/^/   后端: /'
+  for entry in "${REPOS[@]}"; do
+    local label repo
+    label="${entry%%	*}"
+    repo="${entry#*	}"
+    git -C "$repo" worktree add "$dir/$label" -b "$name" "$(base_branch "$repo")" 2>&1 \
+      | sed "s/^/   $label: /"
+  done
   context_write "$name" "$desc"
   echo "✅ 任务 $name 已创建"
-  echo "   cd $dir/UMES3 && claude -w $name"
+  local first="${REPOS[0]%%	*}"
+  echo "   cd $dir/$first"
 }
 
 cmd_list() {
-  local dir
-  dir=$(worktree_path "")
-  [ -d "$dir" ] || { echo "暂无任务"; return; }
-  printf "%-25s %-12s %-10s %-10s\n" "任务名" "创建时间" "UMES3" "fa56-php"
-  printf "%-25s %-12s %-10s %-10s\n" "───────" "────────" "─────" "──────"
-  for task in "$dir"/*/; do
-    local name
-    name=$(basename "$task")
-    local ctime
-    ctime=$(head -2 "$task/CONTEXT.md" 2>/dev/null | grep "创建时间" | sed 's/.*: //')
-    ctime=${ctime:-"-"}
-    local s1 s2
-    s1=$(repo_status "$WT_UMES3" "$name")
-    s2=$(repo_status "$WT_FA56" "$name")
-    printf "%-25s %-12s %-10s %-10s\n" "$name" "$ctime" "$s1" "$s2"
+  local root="$WT_ROOT"
+  [ -d "$root" ] || { echo "暂无任务"; return; }
+  local any=false
+  for pdir in "$root"/*/; do
+    [ ! -d "$pdir" ] && continue
+    local project
+    project="$(basename "$pdir")"
+    echo "─── $project ───"
+    for tdir in "$pdir"/*/; do
+      [ ! -d "$tdir" ] && continue
+      local name ctime
+      name="$(basename "$tdir")"
+      ctime=$(head -3 "$tdir/CONTEXT.md" 2>/dev/null | grep "创建时间" | sed 's/.*: //')
+      ctime=${ctime:-"-"}
+      echo "  $name  ($ctime)"
+      any=true
+    done
   done
+  $any || echo "暂无任务"
 }
 
 cmd_status() {
-  local name=$1 dir
+  local name=$1
+  resolve_project
+  local dir
   dir=$(worktree_path "$name")
   [ -d "$dir" ] || { echo "❌ 任务 $name 不存在"; exit 1; }
-  for pair in "UMES3 $WT_UMES3" "fa56-php $WT_FA56"; do
+  for entry in "${REPOS[@]}"; do
     local label repo
-    read -r label repo <<< "$pair"
+    label="${entry%%	*}"
+    repo="${entry#*	}"
     echo "─── $label ───"
     local wd="$dir/$label"
     if [ ! -d "$wd" ]; then
@@ -129,12 +163,14 @@ cmd_commit() {
     [ "$arg" = "--no-push" ] && no_push=true
     [ "$arg" = "--amend" ] && amend=true
   done
+  resolve_project
   local dir
   dir=$(worktree_path "$name")
   [ -d "$dir" ] || { echo "❌ 任务 $name 不存在"; exit 1; }
-  for pair in "UMES3 $WT_UMES3" "fa56-php $WT_FA56"; do
+  for entry in "${REPOS[@]}"; do
     local label repo
-    read -r label repo <<< "$pair"
+    label="${entry%%	*}"
+    repo="${entry#*	}"
     local wd="$dir/$label"
     [ ! -d "$wd" ] && { echo "⚠️  $label worktree 不存在，跳过"; continue; }
     local has_changes
@@ -152,12 +188,15 @@ cmd_commit() {
 }
 
 cmd_rebase() {
-  local name=$1 dir
+  local name=$1
+  resolve_project
+  local dir
   dir=$(worktree_path "$name")
   [ -d "$dir" ] || { echo "❌ 任务 $name 不存在"; exit 1; }
-  for pair in "UMES3 $WT_UMES3" "fa56-php $WT_FA56"; do
+  for entry in "${REPOS[@]}"; do
     local label repo
-    read -r label repo <<< "$pair"
+    label="${entry%%	*}"
+    repo="${entry#*	}"
     local wd="$dir/$label"
     [ ! -d "$wd" ] && { echo "⚠️  $label worktree 不存在，跳过"; continue; }
     local base
@@ -177,12 +216,14 @@ cmd_cleanup() {
   local name=$1; shift
   local force=false
   for arg in "$@"; do [ "$arg" = "--force" ] && force=true; done
+  resolve_project
   local dir
   dir=$(worktree_path "$name")
   [ -d "$dir" ] || { echo "❌ 任务 $name 不存在"; exit 1; }
-  for pair in "UMES3 $WT_UMES3" "fa56-php $WT_FA56"; do
+  for entry in "${REPOS[@]}"; do
     local label repo
-    read -r label repo <<< "$pair"
+    label="${entry%%	*}"
+    repo="${entry#*	}"
     local wd="$dir/$label"
     [ ! -d "$wd" ] && { echo "⚠️  $label worktree 不存在，跳过"; continue; }
     if ! $force; then
@@ -211,52 +252,57 @@ cmd_cleanup() {
 }
 
 cmd_doctor() {
-  local dir
-  dir=$(worktree_path "")
-  [ -d "$dir" ] || { echo "✅ 无残留任务"; return; }
+  local root="$WT_ROOT"
+  [ -d "$root" ] || { echo "✅ 无残留任务"; return; }
   local found=false
-  for task in "$dir"/*/; do
-    local name
-    name=$(basename "$task")
-    local issues=()
-    [ ! -f "$task/CONTEXT.md" ] && issues+=("缺 CONTEXT.md")
-    [ ! -d "$task/UMES3" ] && issues+=("前端 worktree 缺失")
-    [ ! -d "$task/fa56-php" ] && issues+=("后端 worktree 缺失")
-    if [ -d "$task/UMES3" ]; then
-      local branch
-      branch=$(git -C "$task/UMES3" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "detached")
-      local base
-      base=$(base_branch "$WT_UMES3")
-      local merged
-      merged=$(git -C "$WT_UMES3" branch --merged "origin/$base" 2>/dev/null \
-        | grep -q "^\*\| $branch$" && echo true || echo false)
-      [ "$merged" = "true" ] && issues+=("前端分支已合并，可清理")
-    fi
-    if [ ${#issues[@]} -gt 0 ]; then
-      found=true
-      echo "─── $name ───"
-      for i in "${issues[@]}"; do echo "   ⚠️  $i"; done
-    fi
+  for pdir in "$root"/*/; do
+    [ ! -d "$pdir" ] && continue
+    local project
+    project="$(basename "$pdir")"
+    for tdir in "$pdir"/*/; do
+      [ ! -d "$tdir" ] && continue
+      local name
+      name="$(basename "$tdir")"
+      local issues=()
+      [ ! -f "$tdir/CONTEXT.md" ] && issues+=("缺 CONTEXT.md")
+      if [ ${#issues[@]} -gt 0 ]; then
+        found=true
+        echo "─── $project / $name ───"
+        for i in "${issues[@]}"; do echo "   ⚠️  $i"; done
+      fi
+    done
   done
   $found || echo "✅ 无异常"
 }
 
 # ── Dispatch ─────────────────────────────────────────────
 usage() {
-  echo "用法: wt <命令> [参数]"
+  echo "用法: wt [-p <项目目录>] <命令> [参数]"
   echo ""
   echo "命令:"
   echo "  create <name> [-m <描述>]   创建跨仓库 worktree"
   echo "  list                         列出活跃任务"
-  echo "  status <name>                查看两仓库状态"
+  echo "  status <name>                查看仓库状态"
   echo "  commit <name> <msg> [选项]   提交+推送"
   echo "                               选项: --no-push, --amend"
-  echo "  rebase <name>                两仓库 rebase 主分支"
+  echo "  rebase <name>                仓库 rebase 主分支"
   echo "  cleanup <name> [--force]     清理 worktree"
   echo "  doctor                       检查残留 worktree"
+  echo ""
+  echo "示例:"
+  echo "  cd ~/projects/UMES3 && wt create fix-login"
+  echo "  wt -p ~/projects/CeLiangBen status fix-order"
 }
 
 load_config
+
+# Parse -p global option
+PROJECT_FLAG=""
+if [ $# -ge 2 ] && [ "$1" = "-p" ]; then
+  PROJECT_FLAG="$2"
+  shift 2
+fi
+
 [ $# -lt 1 ] && { usage; exit 1; }
 
 case "${1:-}" in
