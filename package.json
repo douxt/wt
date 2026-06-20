@@ -1,0 +1,18 @@
+{
+  "name": "wt-multi-repo",
+  "version": "1.0.0",
+  "description": "多仓库 git worktree 管理器 — 一键创建/提交/清理跨仓库 worktree",
+  "bin": {
+    "wt": "./wt"
+  },
+  "files": [
+    "wt",
+    "README.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://gitee.com/cybxcoder/wt.git"
+  },
+  "keywords": ["git", "worktree", "multi-repo", "cli"],
+  "license": "MIT"
+}
