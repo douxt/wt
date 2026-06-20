@@ -3,15 +3,21 @@ set -e
 
 INSTALL_DIR="${HOME}/.local/bin"
 VERSION="1.0.0"
-RAW_BASE="https://raw.githubusercontent.com/douxt/wt/v${VERSION}"
+GITHUB="https://raw.githubusercontent.com/douxt/wt/v${VERSION}"
+GITEE="https://gitee.com/cybxcoder/wt/raw/v${VERSION}"
 
 echo "=== wt ${VERSION} 安装 ==="
 echo ""
 
 mkdir -p "$INSTALL_DIR"
 
-echo "⬇  下载 wt ${VERSION} ..."
-curl -fsSL "${RAW_BASE}/wt" -o "$INSTALL_DIR/wt"
+echo "⬇ 下载 wt ${VERSION} ..."
+if ! curl -fsSL "${GITHUB}/wt" -o "$INSTALL_DIR/wt" 2>/dev/null; then
+  echo "   GitHub 连接失败，尝试 Gitee ..."
+  curl -fsSL "${GITEE}/wt" -o "$INSTALL_DIR/wt" || {
+    echo "❌ 下载失败，请检查网络"; exit 1
+  }
+fi
 chmod +x "$INSTALL_DIR/wt"
 echo "✅ wt → $INSTALL_DIR/wt"
 

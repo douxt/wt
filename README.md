@@ -10,6 +10,7 @@
 curl -fsSL https://raw.githubusercontent.com/douxt/wt/v1.0.0/install.sh | bash
 ```
 
+> 国内网络 GitHub 不可用时，将 `raw.githubusercontent.com` 替换为 `gitee.com/cybxcoder/wt/raw`。
 > 可先 `curl url > install.sh && less install.sh` 审阅再执行。
 
 ### npm
