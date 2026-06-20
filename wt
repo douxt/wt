@@ -305,19 +305,19 @@ cmd_update() {
   fi
   local target="$self"
   local latest tag url
-  # GitHub 优先，Gitee 回退
-  for pair in "github:https://github.com/douxt/wt.git:https://raw.githubusercontent.com/douxt/wt" \
-              "gitee:https://gitee.com/cybxcoder/wt.git:https://gitee.com/cybxcoder/wt/raw"; do
-    repo_url="${pair#*:}"; repo_url="${repo_url%%:*}"
-    raw_base="${pair##*:}"
-    latest=$(git ls-remote --tags "$repo_url" 2>/dev/null \
-      | sed 's/.*refs\/tags\///' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | tail -1)
-    if [ -n "$latest" ]; then
-      tag="$latest"
-      url="${raw_base}/${tag}/wt"
-      break
-    fi
-  done
+  # GitHub 优先
+  latest=$(git ls-remote --tags https://github.com/douxt/wt.git 2>/dev/null \
+    | sed 's/.*refs\/tags\///' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | tail -1 || true)
+  if [ -n "$latest" ]; then
+    tag="$latest"
+    url="https://raw.githubusercontent.com/douxt/wt/${tag}/wt"
+  fi
+  # Gitee 回退
+  if [ -z "$latest" ]; then
+    latest=$(git ls-remote --tags https://gitee.com/cybxcoder/wt.git 2>/dev/null \
+      | sed 's/.*refs\/tags\///' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | tail -1 || true)
+    [ -n "$latest" ] && tag="$latest" && url="https://gitee.com/cybxcoder/wt/raw/${tag}/wt"
+  fi
   tag="${tag:-master}"
   url="${url:-https://raw.githubusercontent.com/douxt/wt/master/wt}"
   curl -fsSL "$url" -o "$target.tmp" && chmod +x "$target.tmp" && mv "$target.tmp" "$target"
