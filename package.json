@@ -1,6 +1,6 @@
 {
   "name": "wt-multi-repo",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "多仓库 git worktree 管理器 — 一键创建/提交/清理跨仓库 worktree",
   "bin": {
     "wt": "./wt"
