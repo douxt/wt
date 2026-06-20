@@ -7,7 +7,7 @@
 ### curl 一键安装
 
 ```bash
-curl -fsSL https://gitee.com/cybxcoder/wt/raw/v1.0.0/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/douxt/wt/v1.0.0/install.sh | bash
 ```
 
 > 可先 `curl url > install.sh && less install.sh` 审阅再执行。

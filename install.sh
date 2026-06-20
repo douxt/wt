@@ -3,7 +3,7 @@ set -e
 
 INSTALL_DIR="${HOME}/.local/bin"
 VERSION="1.0.0"
-RAW_BASE="https://gitee.com/cybxcoder/wt/raw/v${VERSION}"
+RAW_BASE="https://raw.githubusercontent.com/douxt/wt/v${VERSION}"
 
 echo "=== wt ${VERSION} 安装 ==="
 echo ""
