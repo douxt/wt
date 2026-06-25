@@ -2,7 +2,7 @@
 set -e
 
 INSTALL_DIR="${HOME}/.local/bin"
-VERSION="1.0.2"
+VERSION="1.1.0"
 GITHUB="https://raw.githubusercontent.com/douxt/wt/v${VERSION}"
 GITEE="https://gitee.com/cybxcoder/wt/raw/v${VERSION}"
 
@@ -20,6 +20,16 @@ if ! curl -fsSL "${GITHUB}/wt" -o "$INSTALL_DIR/wt" 2>/dev/null; then
 fi
 chmod +x "$INSTALL_DIR/wt"
 echo "✅ wt → $INSTALL_DIR/wt"
+
+echo "⬇ 下载 wt-dev ${VERSION} ..."
+if ! curl -fsSL "${GITHUB}/wt-dev" -o "$INSTALL_DIR/wt-dev" 2>/dev/null; then
+  echo "   GitHub 连接失败，尝试 Gitee ..."
+  curl -fsSL "${GITEE}/wt-dev" -o "$INSTALL_DIR/wt-dev" || {
+    echo "❌ 下载失败，请检查网络"; exit 1
+  }
+fi
+chmod +x "$INSTALL_DIR/wt-dev"
+echo "✅ wt-dev → $INSTALL_DIR/wt-dev"
 
 if [ ! -f "$HOME/.wtconfig" ]; then
   cat > "$HOME/.wtconfig" << 'EOF'

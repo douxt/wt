@@ -1,0 +1,300 @@
+#!/usr/bin/env bash
+# wt-dev — worktree 前后端联合开发环境管理
+# 被 wt dev/dev-stop/dev-status 调用，也可直接使用
+
+set -euo pipefail
+
+WT_ROOT="${WT_ROOT:-$HOME/wt}"
+PORTS_FILE="$HOME/.wt-ports"
+
+# ============================================================
+# 工具函数
+# ============================================================
+
+die() { echo "❌ $*" >&2; exit 1; }
+info() { echo "🔧 $*"; }
+ok() { echo "✅ $*"; }
+
+# 端口检测：检查是否被占用
+port_free() {
+    local port="$1"
+    if ss -tlnp 2>/dev/null | grep -q ":$port "; then
+        return 1
+    elif netstat -tlnp 2>/dev/null | grep -q ":$port "; then
+        return 1
+    elif grep -q ":$port " /proc/net/tcp 2>/dev/null; then
+        return 1
+    fi
+    return 0
+}
+
+# 哈希偏移
+hash_offset() {
+    local path="$1"
+    echo $(( $(echo "$path" | cksum | awk '{print $1}') % 100 ))
+}
+
+# ============================================================
+# detect_worktree — 从 $PWD 或参数提取 task 名
+# ============================================================
+detect_worktree() {
+    local task="${1:-}"
+    if [[ -n "$task" ]]; then
+        echo "$task"
+        return
+    fi
+    # 自动从 $PWD 提取：~/wt/<project>/<task>/...
+    if [[ "$PWD" =~ $WT_ROOT/[^/]+/([^/]+) ]]; then
+        echo "${BASH_REMATCH[1]}"
+        return
+    fi
+    die "未检测到 worktree 上下文，请用 wt dev <任务名> 指定，或在 worktree 目录下执行"
+}
+
+# ============================================================
+# alloc_ports — 哈希计算 + 可用性检查
+# ============================================================
+alloc_ports() {
+    local task="$1"
+    local wp_base=8886
+    local ng_base=8890
+
+    # 检查是否已有分配记录
+    local existing
+    existing=$(grep "^$task " "$PORTS_FILE" 2>/dev/null || true)
+    if [[ -n "$existing" ]]; then
+        local wp ng
+        wp=$(echo "$existing" | awk '{print $2}')
+        ng=$(echo "$existing" | awk '{print $3}')
+        if port_free "$wp" && port_free "$ng"; then
+            echo "$wp $ng"
+            return
+        fi
+        info "已分配端口 ($wp/$ng) 被占用，重新计算"
+    fi
+
+    local offset
+    offset=$(hash_offset "$HOME/wt/UMES3/$task")
+    local wp=$((wp_base + offset))
+    local ng=$((ng_base + offset))
+
+    # 冲突则递增
+    while ! port_free "$wp"; do wp=$((wp + 1)); done
+    while ! port_free "$ng"; do ng=$((ng + 1)); done
+
+    # flock 写入记录
+    (
+        flock -x 200
+        grep -v "^$task " "$PORTS_FILE" 2>/dev/null > "${PORTS_FILE}.tmp" || true
+        echo "$task $wp $ng $(date +%s)" >> "${PORTS_FILE}.tmp"
+        mv "${PORTS_FILE}.tmp" "$PORTS_FILE"
+    ) 200>"${PORTS_FILE}.lock"
+
+    echo "$wp $ng"
+}
+
+# ============================================================
+# start_backend — 启动 Docker (nginx + php-fpm)
+# ============================================================
+start_backend() {
+    local task="$1" ng_port="$2"
+    local fa56_path="$WT_ROOT/UMES3/$task/fa56-php"
+
+    [[ -d "$fa56_path" ]] || die "fa56-php worktree 不存在: $fa56_path"
+
+    cat > "$fa56_path/.env" <<EOF
+FA56_PHP_PATH=$fa56_path
+NGINX_HOST_PORT=$ng_port
+EOF
+
+    info "启动后端容器 (nginx:$ng_port)..."
+    docker compose -p "fa56-php-$task" -f "$fa56_path/docker-compose.yml" up -d --wait 2>&1 | tail -3
+
+    info "等待 nginx 就绪..."
+    for i in $(seq 1 30); do
+        if curl -s -o /dev/null "http://localhost:$ng_port"; then
+            ok "nginx 就绪 (localhost:$ng_port)"
+            return 0
+        fi
+        sleep 1
+    done
+    die "nginx 启动超时 (30s)，请检查 docker logs"
+}
+
+# ============================================================
+# start_frontend — 启动 webpack-dev-server
+# ============================================================
+start_frontend() {
+    local task="$1" wp_port="$2" ng_port="$3"
+    local umes_path="$WT_ROOT/UMES3/$task/UMES3/react-scaffold"
+    local umes_root="$WT_ROOT/UMES3/$task/UMES3"
+    local main_nm="$HOME/projects/UMES3/react-scaffold/node_modules"
+
+    [[ -d "$umes_path" ]] || die "UMES3 worktree 不存在: $umes_path"
+
+    if [[ ! -d "$umes_path/node_modules" ]]; then
+        if [[ -d "$main_nm" ]]; then
+            info "链接主仓库 node_modules..."
+            ln -s "$main_nm" "$umes_path/node_modules"
+        else
+            die "node_modules 不存在，请先: cd $umes_path && npm install"
+        fi
+    fi
+
+    # 自动匹配 .nvmrc 指定的 Node 版本
+    local node_bin_dir=""
+    if [[ -f "$umes_root/.nvmrc" ]]; then
+        local nvm_ver
+        nvm_ver=$(cat "$umes_root/.nvmrc" | tr -d '[:space:]')
+        local nvm_node_dir="$HOME/.nvm/versions/node/v$nvm_ver/bin"
+        if [[ -d "$nvm_node_dir" ]] && [[ -x "$nvm_node_dir/node" ]]; then
+            node_bin_dir="$nvm_node_dir"
+            info "使用 Node $nvm_ver（来自 .nvmrc）"
+        fi
+    fi
+
+    info "启动前端 (webpack:$wp_port, 代理 -> nginx:$ng_port)..."
+    info "访问 http://localhost:$wp_port"
+
+    cd "$umes_path"
+    if [[ -n "$node_bin_dir" ]]; then
+        PATH="$node_bin_dir:$PATH" DEV_PORT="$wp_port" LOCAL_API_PORT="$ng_port" \
+            npx webpack-dev-server --config webpack.config.dev.js --env.api=local --no-open \
+                --port "$wp_port" 2>&1 &
+    else
+        DEV_PORT="$wp_port" LOCAL_API_PORT="$ng_port" \
+            npx webpack-dev-server --config webpack.config.dev.js --env.api=local --no-open \
+                --port "$wp_port" 2>&1 &
+    fi
+    local wds_pid=$!
+    echo "$wds_pid" > "/tmp/wt-dev-webpack-$task.pid"
+    ok "webpack-dev-server PID: $wds_pid"
+}
+
+# ============================================================
+# cmd_dev — 启动全部
+# ============================================================
+cmd_dev() {
+    local task
+    task=$(detect_worktree "${1:-}")
+
+    docker info >/dev/null 2>&1 || die "Docker 未运行，请先启动 Docker"
+
+    info "任务: $task"
+
+    local ports wp ng
+    ports=$(alloc_ports "$task")
+    wp=$(echo "$ports" | awk '{print $1}')
+    ng=$(echo "$ports" | awk '{print $2}')
+
+    ok "端口分配: webpack=$wp, nginx=$ng"
+
+    start_backend "$task" "$ng"
+    start_frontend "$task" "$wp" "$ng"
+
+    echo ""
+    ok "开发环境已启动"
+    echo "   前端: http://localhost:$wp"
+    echo "   后端: http://localhost:$ng"
+    echo "   停止: wt dev-stop $task"
+}
+
+# ============================================================
+# cmd_dev_stop — 停止全部
+# ============================================================
+cmd_dev_stop() {
+    local task
+    task=$(detect_worktree "${1:-}")
+    local fa56_path="$WT_ROOT/UMES3/$task/fa56-php"
+
+    info "停止 $task..."
+
+    if [[ -f "/tmp/wt-dev-webpack-$task.pid" ]]; then
+        kill "$(cat "/tmp/wt-dev-webpack-$task.pid")" 2>/dev/null || true
+        rm -f "/tmp/wt-dev-webpack-$task.pid"
+        info "webpack-dev-server 已停止"
+    else
+        local ports
+        ports=$(grep "^$task " "$PORTS_FILE" 2>/dev/null || true)
+        if [[ -n "$ports" ]]; then
+            local wp=$(echo "$ports" | awk '{print $2}')
+            local wds_pid
+            wds_pid=$(ss -tlnp 2>/dev/null | grep ":$wp " | grep -oP 'pid=\K\d+' || true)
+            [[ -n "$wds_pid" ]] && kill "$wds_pid" 2>/dev/null || true
+        fi
+    fi
+
+    if [[ -d "$fa56_path" ]]; then
+        docker compose -p "fa56-php-$task" -f "$fa56_path/docker-compose.yml" down 2>&1 | tail -2
+    fi
+
+    grep -v "^$task " "$PORTS_FILE" 2>/dev/null > "${PORTS_FILE}.tmp" || true
+    mv "${PORTS_FILE}.tmp" "$PORTS_FILE" 2>/dev/null || true
+
+    ok "$task 已停止"
+}
+
+# ============================================================
+# cmd_dev_status — 查看状态
+# ============================================================
+cmd_dev_status() {
+    local task="${1:-}"
+    if [[ -z "$task" ]]; then
+        task=$(detect_worktree "" 2>/dev/null || echo "")
+    fi
+
+    echo "📊 Worktree 开发环境状态"
+    echo "========================="
+
+    if [[ -f "$PORTS_FILE" ]] && [[ -s "$PORTS_FILE" ]]; then
+        echo ""
+        echo "已分配端口:"
+        while read -r t wp ng ts; do
+            local wp_status="⬇" ng_status="⬇"
+            port_free "$wp" 2>/dev/null && wp_status="✅" || wp_status="🟢"
+            port_free "$ng" 2>/dev/null && ng_status="✅" || ng_status="🟢"
+            printf "  %-25s  webpack: %s (%s)  nginx: %s (%s)\n" "$t" "$wp" "$wp_status" "$ng" "$ng_status"
+        done < "$PORTS_FILE"
+    else
+        echo "  无运行中的开发环境"
+    fi
+
+    echo ""
+    echo "Docker 容器:"
+    docker ps --filter "name=fa56-php-" --format '  {{.Names}}  {{.Status}}' 2>/dev/null || echo "  (无)"
+}
+
+# ============================================================
+# 入口
+# ============================================================
+
+usage() {
+    echo "用法: wt dev [任务名]       启动开发环境"
+    echo "      wt dev-stop [任务名]   停止开发环境"
+    echo "      wt dev-status [任务名] 查看状态"
+    exit 0
+}
+
+case "${1:-}" in
+    dev)
+        shift
+        [[ "${1:-}" == "--help" ]] && usage
+        cmd_dev "$@"
+        ;;
+    dev-stop)
+        shift
+        [[ "${1:-}" == "--help" ]] && usage
+        cmd_dev_stop "$@"
+        ;;
+    dev-status)
+        shift
+        [[ "${1:-}" == "--help" ]] && usage
+        cmd_dev_status "$@"
+        ;;
+    --help|-h|help)
+        usage
+        ;;
+    *)
+        usage
+        ;;
+esac

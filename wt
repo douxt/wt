@@ -9,7 +9,7 @@ PROJECT_DIR=""
 REPOS=()
 
 # ── Config ──────────────────────────────────────────────
-VERSION="1.0.2"
+VERSION="1.1.0"
 
 load_config() {
   local cfg="$HOME/.wtconfig"
@@ -338,10 +338,14 @@ usage() {
   echo "  cleanup <name> [--force]     清理 worktree"
   echo "  doctor                       检查残留 worktree"
   echo "  update                       更新 wt 到最新版"
+  echo "  dev [task]                   启动 worktree 前后端开发环境"
+  echo "  dev-stop [task]              停止开发环境"
+  echo "  dev-status [task]            查看开发环境状态"
   echo ""
   echo "示例:"
   echo "  cd ~/projects/UMES3 && wt create fix-login"
   echo "  wt -p ~/projects/CeLiangBen status fix-order"
+  echo "  wt dev                       在当前 worktree 启动开发环境"
 }
 
 load_config
@@ -383,5 +387,8 @@ case "${1:-}" in
     ;;
   doctor) cmd_doctor ;;
   update) cmd_update ;;
+  dev|dev-stop|dev-status)
+    exec bash ~/bin/wt-dev "$@"
+    ;;
   *) usage; exit 1 ;;
 esac
