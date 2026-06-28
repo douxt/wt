@@ -2,7 +2,7 @@
 set -e
 
 INSTALL_DIR="${HOME}/.local/bin"
-VERSION="1.1.0"
+VERSION="1.1.1"
 GITHUB="https://raw.githubusercontent.com/douxt/wt/v${VERSION}"
 GITEE="https://gitee.com/cybxcoder/wt/raw/v${VERSION}"
 

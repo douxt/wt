@@ -9,7 +9,7 @@ PROJECT_DIR=""
 REPOS=()
 
 # ── Config ──────────────────────────────────────────────
-VERSION="1.1.0"
+VERSION="1.1.1"
 
 load_config() {
   local cfg="$HOME/.wtconfig"
