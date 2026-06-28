@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # wt-dev — worktree 前后端联合开发环境管理
 # 被 wt dev/dev-stop/dev-status 调用，也可直接使用
+# v1.1.1 — 通用化：自动检测单仓/双仓/多仓项目
 
 set -euo pipefail
 
@@ -14,188 +15,334 @@ PORTS_FILE="$HOME/.wt-ports"
 die() { echo "❌ $*" >&2; exit 1; }
 info() { echo "🔧 $*"; }
 ok() { echo "✅ $*"; }
+warn() { echo "⚠️  $*"; }
 
-# 端口检测：检查是否被占用
 port_free() {
     local port="$1"
-    if ss -tlnp 2>/dev/null | grep -q ":$port "; then
-        return 1
-    elif netstat -tlnp 2>/dev/null | grep -q ":$port "; then
-        return 1
-    elif grep -q ":$port " /proc/net/tcp 2>/dev/null; then
-        return 1
-    fi
+    ss -tlnp 2>/dev/null | grep -q ":$port " && return 1
+    netstat -tlnp 2>/dev/null | grep -q ":$port " && return 1
+    grep -q ":$port " /proc/net/tcp 2>/dev/null && return 1
     return 0
 }
 
-# 哈希偏移
 hash_offset() {
     local path="$1"
     echo $(( $(echo "$path" | cksum | awk '{print $1}') % 100 ))
 }
 
 # ============================================================
-# detect_worktree — 从 $PWD 或参数提取 task 名
+# detect_worktree — 从 $PWD 或参数提取 project + task
+# 输出: "project task"
 # ============================================================
 detect_worktree() {
     local task="${1:-}"
+
+    # 从 PWD 提取 project 和 task
+    if [[ "$PWD" =~ $WT_ROOT/([^/]+)/([^/]+) ]]; then
+        local p="${BASH_REMATCH[1]}"
+        local t="${BASH_REMATCH[2]}"
+        if [[ -n "$task" ]]; then
+            echo "$p $task"
+        else
+            echo "$p $t"
+        fi
+        return
+    fi
+
+    # PWD 不在 worktree，但指定了 task：扫描找项目
     if [[ -n "$task" ]]; then
-        echo "$task"
-        return
+        local matches=()
+        for pdir in "$WT_ROOT"/*/; do
+            [[ -d "$pdir" ]] || continue
+            local p; p=$(basename "$pdir")
+            [[ -d "$pdir/$task" ]] && matches+=("$p")
+        done
+        if [[ ${#matches[@]} -eq 1 ]]; then
+            echo "${matches[0]} $task"
+            return
+        elif [[ ${#matches[@]} -gt 1 ]]; then
+            die "任务 $task 存在于多个项目: ${matches[*]}，请先 cd 到项目目录"
+        fi
+        die "未找到任务 $task，请先 wt create $task"
     fi
-    # 自动从 $PWD 提取：~/wt/<project>/<task>/...
-    if [[ "$PWD" =~ $WT_ROOT/[^/]+/([^/]+) ]]; then
-        echo "${BASH_REMATCH[1]}"
-        return
-    fi
+
     die "未检测到 worktree 上下文，请用 wt dev <任务名> 指定，或在 worktree 目录下执行"
 }
 
 # ============================================================
-# alloc_ports — 哈希计算 + 可用性检查
+# discover_services — 扫描 worktree，检测后端/前端服务
+# 全局数组: WT_BACKENDS, WT_FRONTENDS  格式: "repo_name:path"
 # ============================================================
-alloc_ports() {
-    local task="$1"
-    local wp_base=8886
-    local ng_base=8890
+declare -g -a WT_BACKENDS=()
+declare -g -a WT_FRONTENDS=()
 
-    # 检查是否已有分配记录
-    local existing
-    existing=$(grep "^$task " "$PORTS_FILE" 2>/dev/null || true)
-    if [[ -n "$existing" ]]; then
-        local wp ng
-        wp=$(echo "$existing" | awk '{print $2}')
-        ng=$(echo "$existing" | awk '{print $3}')
-        if port_free "$wp" && port_free "$ng"; then
-            echo "$wp $ng"
-            return
+discover_services() {
+    local project="$1" task="$2"
+    local dir="$WT_ROOT/$project/$task"
+    [[ -d "$dir" ]] || die "worktree 目录不存在: $dir"
+
+    WT_BACKENDS=()
+    WT_FRONTENDS=()
+    local skipped=()
+
+    for subdir in "$dir"/*/; do
+        [[ -d "$subdir" ]] || continue
+        local repo_name; repo_name=$(basename "$subdir")
+        [[ "$repo_name" == .* ]] && continue
+        [[ "$repo_name" == node_modules ]] && continue
+
+        local found=false
+
+        # 检测 backend: docker-compose.yml（repo 根 + 一级子目录）
+        local compose_file=""
+        if [[ -f "$subdir/docker-compose.yml" ]]; then
+            compose_file="$subdir/docker-compose.yml"
+        else
+            for d in "$subdir"/*/; do
+                [[ -d "$d" ]] || continue
+                [[ -f "$d/docker-compose.yml" ]] && { compose_file="$d/docker-compose.yml"; break; }
+            done
         fi
-        info "已分配端口 ($wp/$ng) 被占用，重新计算"
+        if [[ -n "$compose_file" ]]; then
+            found=true
+            if grep -q '\${[A-Z_][A-Z0-9_]*' "$compose_file"; then
+                local compose_dir; compose_dir=$(dirname "$compose_file")
+                WT_BACKENDS+=("$repo_name:$compose_dir")
+            else
+                skipped+=("$repo_name (docker-compose.yml 未参数化)")
+            fi
+        fi
+
+        # 检测 frontend: webpack.config.dev.js（递归最多 3 层）
+        local webpack_file
+        webpack_file=$(find "$subdir" -maxdepth 3 -name 'webpack.config.dev.js' \
+            -not -path '*/node_modules/*' 2>/dev/null | head -1)
+        if [[ -n "$webpack_file" ]]; then
+            local webpack_dir; webpack_dir=$(dirname "$webpack_file")
+            WT_FRONTENDS+=("$repo_name:$webpack_dir")
+            found=true
+        fi
+
+        $found || skipped+=("$repo_name")
+    done
+
+    for s in "${skipped[@]}"; do
+        warn "跳过: $s (无可检测的开发服务)"
+    done
+
+    if [[ ${#WT_BACKENDS[@]} -eq 0 ]] && [[ ${#WT_FRONTENDS[@]} -eq 0 ]]; then
+        die "未检测到可启动的开发服务（docker-compose.yml 或 webpack.config.dev.js）"
     fi
 
-    local offset
-    offset=$(hash_offset "$HOME/wt/UMES3/$task")
-    local wp=$((wp_base + offset))
-    local ng=$((ng_base + offset))
-
-    # 冲突则递增
-    while ! port_free "$wp"; do wp=$((wp + 1)); done
-    while ! port_free "$ng"; do ng=$((ng + 1)); done
-
-    # flock 写入记录
-    (
-        flock -x 200
-        grep -v "^$task " "$PORTS_FILE" 2>/dev/null > "${PORTS_FILE}.tmp" || true
-        echo "$task $wp $ng $(date +%s)" >> "${PORTS_FILE}.tmp"
-        mv "${PORTS_FILE}.tmp" "$PORTS_FILE"
-    ) 200>"${PORTS_FILE}.lock"
-
-    echo "$wp $ng"
+    ok "检测到 ${#WT_BACKENDS[@]} 个后端, ${#WT_FRONTENDS[@]} 个前端"
 }
 
 # ============================================================
-# start_backend — 启动 Docker (nginx + php-fpm)
+# alloc_port — 为单个服务分配端口
+# ============================================================
+alloc_port() {
+    local task="$1" project="$2" repo="$3" base="$4" idx="$5"
+
+    local offset; offset=$(hash_offset "$WT_ROOT/$project/$task")
+    local port=$((base + offset + idx))
+
+    while ! port_free "$port"; do port=$((port + 1)); done
+    echo "$port"
+}
+
+# ============================================================
+# write_docker_env — 提取 compose 中的 ${VAR}，按需写 .env
+# ============================================================
+write_docker_env() {
+    local compose_file="$1" repo_path="$2" port="$3"
+    local env_file="$repo_path/.env"
+
+    local vars
+    vars=$(grep -oP '\$\{[A-Z_][A-Z0-9_]*(?::-[^}]*)?\}' "$compose_file" 2>/dev/null \
+        | sed 's/\${//; s/:.*//; s/}//' | sort -u || true)
+    [[ -z "$vars" ]] && return
+
+    > "$env_file"
+    while IFS= read -r var; do
+        [[ -z "$var" ]] && continue
+        if [[ "$var" == *_PORT ]] || [[ "$var" == *PORT* ]]; then
+            echo "$var=$port" >> "$env_file"
+        elif [[ "$var" == *_PATH ]] || [[ "$var" == *_DIR ]]; then
+            echo "$var=$repo_path" >> "$env_file"
+        else
+            echo "$var=" >> "$env_file"
+        fi
+    done <<< "$vars"
+
+    info "已写入 $env_file"
+}
+
+# ============================================================
+# start_backend — 启动 Docker Compose 后端
 # ============================================================
 start_backend() {
-    local task="$1" ng_port="$2"
-    local fa56_path="$WT_ROOT/UMES3/$task/fa56-php"
+    local project="$1" task="$2" repo="$3" repo_path="$4" port="$5"
 
-    [[ -d "$fa56_path" ]] || die "fa56-php worktree 不存在: $fa56_path"
+    [[ -d "$repo_path" ]] || die "后端仓库不存在: $repo_path"
 
-    cat > "$fa56_path/.env" <<EOF
-FA56_PHP_PATH=$fa56_path
-NGINX_HOST_PORT=$ng_port
-EOF
+    local compose_file="$repo_path/docker-compose.yml"
+    [[ -f "$compose_file" ]] || {
+        compose_file=$(find "$repo_path" -maxdepth 1 -name 'docker-compose.yml' 2>/dev/null | head -1)
+        [[ -n "$compose_file" ]] || die "未找到 docker-compose.yml: $repo_path"
+    }
 
-    info "启动后端容器 (nginx:$ng_port)..."
-    docker compose -p "fa56-php-$task" -f "$fa56_path/docker-compose.yml" up -d --wait 2>&1 | tail -3
+    write_docker_env "$compose_file" "$repo_path" "$port"
 
-    info "等待 nginx 就绪..."
+    info "启动后端容器 ($repo:$port)..."
+    docker compose -p "$repo-$task" -f "$compose_file" up -d --wait 2>&1 | tail -3
+
+    info "等待 $repo 就绪..."
     for i in $(seq 1 30); do
-        if curl -s -o /dev/null "http://localhost:$ng_port"; then
-            ok "nginx 就绪 (localhost:$ng_port)"
+        if curl -s -o /dev/null "http://localhost:$port"; then
+            ok "$repo 就绪 (localhost:$port)"
             return 0
         fi
         sleep 1
     done
-    die "nginx 启动超时 (30s)，请检查 docker logs"
+    die "$repo 启动超时 (30s)，请检查 docker logs"
 }
 
 # ============================================================
 # start_frontend — 启动 webpack-dev-server
 # ============================================================
 start_frontend() {
-    local task="$1" wp_port="$2" ng_port="$3"
-    local umes_path="$WT_ROOT/UMES3/$task/UMES3/react-scaffold"
-    local umes_root="$WT_ROOT/UMES3/$task/UMES3"
-    local main_nm="$HOME/projects/UMES3/react-scaffold/node_modules"
+    local project="$1" task="$2" repo="$3" repo_path="$4" port="$5" backend_port="${6:-}"
 
-    [[ -d "$umes_path" ]] || die "UMES3 worktree 不存在: $umes_path"
+    [[ -d "$repo_path" ]] || die "前端仓库不存在: $repo_path"
 
-    if [[ ! -d "$umes_path/node_modules" ]]; then
+    # node_modules 智能链接
+    if [[ ! -d "$repo_path/node_modules" ]]; then
+        local wt_repo_root="$WT_ROOT/$project/$task/$repo"
+        local rel_path="${repo_path#$wt_repo_root}"
+        rel_path="${rel_path#/}"
+        local main_nm="$HOME/projects/$repo/$rel_path/node_modules"
         if [[ -d "$main_nm" ]]; then
             info "链接主仓库 node_modules..."
-            ln -s "$main_nm" "$umes_path/node_modules"
+            ln -s "$main_nm" "$repo_path/node_modules"
         else
-            die "node_modules 不存在，请先: cd $umes_path && npm install"
+            die "node_modules 不存在，请先: cd $repo_path && npm install"
         fi
     fi
 
-    # 自动匹配 .nvmrc 指定的 Node 版本
+    # 自动匹配 .nvmrc（从 frontend 目录向上到 worktree repo 根）
     local node_bin_dir=""
-    if [[ -f "$umes_root/.nvmrc" ]]; then
-        local nvm_ver
-        nvm_ver=$(cat "$umes_root/.nvmrc" | tr -d '[:space:]')
-        local nvm_node_dir="$HOME/.nvm/versions/node/v$nvm_ver/bin"
-        if [[ -d "$nvm_node_dir" ]] && [[ -x "$nvm_node_dir/node" ]]; then
-            node_bin_dir="$nvm_node_dir"
-            info "使用 Node $nvm_ver（来自 .nvmrc）"
+    local search_dir="$repo_path"
+    local wt_repo_root="$WT_ROOT/$project/$task/$repo"
+    while [[ "$search_dir" != "$wt_repo_root" ]] && [[ "$search_dir" != "/" ]]; do
+        if [[ -f "$search_dir/.nvmrc" ]]; then
+            local nvm_ver; nvm_ver=$(cat "$search_dir/.nvmrc" | tr -d '[:space:]')
+            local nvm_node_dir="$HOME/.nvm/versions/node/v$nvm_ver/bin"
+            if [[ -d "$nvm_node_dir" ]] && [[ -x "$nvm_node_dir/node" ]]; then
+                node_bin_dir="$nvm_node_dir"
+                info "使用 Node $nvm_ver（来自 .nvmrc）"
+            fi
+            break
         fi
-    fi
+        search_dir=$(dirname "$search_dir")
+    done
 
-    info "启动前端 (webpack:$wp_port, 代理 -> nginx:$ng_port)..."
-    info "访问 http://localhost:$wp_port"
+    info "启动前端 (webpack:$port, 代理 -> $backend_port)..."
+    info "访问 http://localhost:$port"
 
-    cd "$umes_path"
+    cd "$repo_path"
+
     if [[ -n "$node_bin_dir" ]]; then
-        PATH="$node_bin_dir:$PATH" DEV_PORT="$wp_port" LOCAL_API_PORT="$ng_port" \
+        PATH="$node_bin_dir:$PATH" DEV_PORT="$port" LOCAL_API_PORT="$backend_port" \
             npx webpack-dev-server --config webpack.config.dev.js --env.api=local --no-open \
-                --port "$wp_port" 2>&1 &
+                --port "$port" 2>&1 &
     else
-        DEV_PORT="$wp_port" LOCAL_API_PORT="$ng_port" \
+        DEV_PORT="$port" LOCAL_API_PORT="$backend_port" \
             npx webpack-dev-server --config webpack.config.dev.js --env.api=local --no-open \
-                --port "$wp_port" 2>&1 &
+                --port "$port" 2>&1 &
     fi
     local wds_pid=$!
-    echo "$wds_pid" > "/tmp/wt-dev-webpack-$task.pid"
+    echo "$wds_pid" > "/tmp/wt-dev-webpack-$task-$repo.pid"
     ok "webpack-dev-server PID: $wds_pid"
+}
+
+# ============================================================
+# record_port — 写入端口记录（新格式 7 列）
+# ============================================================
+record_port() {
+    local task="$1" project="$2" repo="$3" service_type="$4" port="$5" pid="${6:--}"
+
+    (
+        flock -x 200
+        grep -v "^$task .* $repo $service_type " "$PORTS_FILE" 2>/dev/null > "${PORTS_FILE}.tmp" || true
+        echo "$task $project $repo $service_type $port $pid $(date +%s)" >> "${PORTS_FILE}.tmp"
+        mv "${PORTS_FILE}.tmp" "$PORTS_FILE"
+    ) 200>"${PORTS_FILE}.lock"
 }
 
 # ============================================================
 # cmd_dev — 启动全部
 # ============================================================
 cmd_dev() {
-    local task
-    task=$(detect_worktree "${1:-}")
+    local project task
+    read -r project task <<< "$(detect_worktree "${1:-}")"
 
     docker info >/dev/null 2>&1 || die "Docker 未运行，请先启动 Docker"
 
-    info "任务: $task"
+    info "项目: $project  任务: $task"
 
-    local ports wp ng
-    ports=$(alloc_ports "$task")
-    wp=$(echo "$ports" | awk '{print $1}')
-    ng=$(echo "$ports" | awk '{print $2}')
+    discover_services "$project" "$task"
 
-    ok "端口分配: webpack=$wp, nginx=$ng"
+    local backend_base=8890 frontend_base=8886
+    local backend_ports=()
 
-    start_backend "$task" "$ng"
-    start_frontend "$task" "$wp" "$ng"
+    # 启动所有后端
+    local idx=0
+    for entry in "${WT_BACKENDS[@]}"; do
+        local repo="${entry%%:*}" repo_path="${entry#*:}"
+        local port
+        port=$(alloc_port "$task" "$project" "$repo" "$backend_base" "$idx")
+        ok "后端端口: $repo=$port"
+        start_backend "$project" "$task" "$repo" "$repo_path" "$port"
+        record_port "$task" "$project" "$repo" "backend" "$port" "-"
+        backend_ports+=("$port")
+        idx=$((idx + 1))
+    done
+
+    # 启动所有前端
+    idx=0
+    for entry in "${WT_FRONTENDS[@]}"; do
+        local repo="${entry%%:*}" repo_path="${entry#*:}"
+        local port
+        port=$(alloc_port "$task" "$project" "$repo" "$frontend_base" "$idx")
+        ok "前端端口: $repo=$port"
+        local bp="${backend_ports[0]:-}"
+        start_frontend "$project" "$task" "$repo" "$repo_path" "$port" "$bp"
+        local wds_pid
+        wds_pid=$(cat "/tmp/wt-dev-webpack-$task-$repo.pid" 2>/dev/null || echo "-")
+        record_port "$task" "$project" "$repo" "frontend" "$port" "$wds_pid"
+        idx=$((idx + 1))
+    done
 
     echo ""
     ok "开发环境已启动"
-    echo "   前端: http://localhost:$wp"
-    echo "   后端: http://localhost:$ng"
+    for entry in "${WT_FRONTENDS[@]}"; do
+        local repo="${entry%%:*}"
+        local line
+        line=$(grep "^$task .* $repo frontend " "$PORTS_FILE" 2>/dev/null | head -1 || true)
+        if [[ -n "$line" ]]; then
+            local p; p=$(echo "$line" | awk '{print $5}')
+            echo "   前端: http://localhost:$p  ($repo)"
+        fi
+    done
+    for entry in "${WT_BACKENDS[@]}"; do
+        local repo="${entry%%:*}"
+        local line
+        line=$(grep "^$task .* $repo backend " "$PORTS_FILE" 2>/dev/null | head -1 || true)
+        if [[ -n "$line" ]]; then
+            local p; p=$(echo "$line" | awk '{print $5}')
+            echo "   后端: http://localhost:$p  ($repo)"
+        fi
+    done
     echo "   停止: wt dev-stop $task"
 }
 
@@ -203,31 +350,49 @@ cmd_dev() {
 # cmd_dev_stop — 停止全部
 # ============================================================
 cmd_dev_stop() {
-    local task
-    task=$(detect_worktree "${1:-}")
-    local fa56_path="$WT_ROOT/UMES3/$task/fa56-php"
+    local project task
+    read -r project task <<< "$(detect_worktree "${1:-}")"
 
-    info "停止 $task..."
+    info "停止 $project/$task..."
 
-    if [[ -f "/tmp/wt-dev-webpack-$task.pid" ]]; then
-        kill "$(cat "/tmp/wt-dev-webpack-$task.pid")" 2>/dev/null || true
-        rm -f "/tmp/wt-dev-webpack-$task.pid"
-        info "webpack-dev-server 已停止"
-    else
-        local ports
-        ports=$(grep "^$task " "$PORTS_FILE" 2>/dev/null || true)
-        if [[ -n "$ports" ]]; then
-            local wp=$(echo "$ports" | awk '{print $2}')
-            local wds_pid
-            wds_pid=$(ss -tlnp 2>/dev/null | grep ":$wp " | grep -oP 'pid=\K\d+' || true)
-            [[ -n "$wds_pid" ]] && kill "$wds_pid" 2>/dev/null || true
-        fi
+    if [[ -f "$PORTS_FILE" ]] && [[ -s "$PORTS_FILE" ]]; then
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            local cols; cols=$(echo "$line" | awk '{print NF}')
+
+            if [[ "$cols" -le 4 ]]; then
+                # 旧格式兼容: task wp_port ng_port ts
+                local t; t=$(echo "$line" | awk '{print $1}')
+                [[ "$t" != "$task" ]] && continue
+                local wp; wp=$(echo "$line" | awk '{print $2}')
+                local wds_pid
+                wds_pid=$(ss -tlnp 2>/dev/null | grep ":$wp " | grep -oP 'pid=\K\d+' || true)
+                [[ -n "$wds_pid" ]] && kill "$wds_pid" 2>/dev/null && info "webpack (port $wp) 已停止"
+                docker compose -p "fa56-php-$task" down 2>/dev/null && info "Docker (旧) 已停止" || true
+            else
+                # 新格式: task project repo type port pid ts
+                local t; t=$(echo "$line" | awk '{print $1}')
+                [[ "$t" != "$task" ]] && continue
+                local repo; repo=$(echo "$line" | awk '{print $3}')
+                local stype; stype=$(echo "$line" | awk '{print $4}')
+                local port; port=$(echo "$line" | awk '{print $5}')
+                local pid; pid=$(echo "$line" | awk '{print $6}')
+
+                if [[ "$stype" == "backend" ]]; then
+                    docker compose -p "$repo-$task" down 2>&1 | tail -2
+                    info "后端 $repo (port $port) 已停止"
+                elif [[ "$stype" == "frontend" ]]; then
+                    [[ -n "$pid" ]] && [[ "$pid" != "-" ]] && kill "$pid" 2>/dev/null || true
+                    local orphan
+                    orphan=$(ss -tlnp 2>/dev/null | grep ":$port " | grep -oP 'pid=\K\d+' || true)
+                    [[ -n "$orphan" ]] && kill "$orphan" 2>/dev/null || true
+                    info "前端 $repo (port $port) 已停止"
+                fi
+            fi
+        done < "$PORTS_FILE"
     fi
 
-    if [[ -d "$fa56_path" ]]; then
-        docker compose -p "fa56-php-$task" -f "$fa56_path/docker-compose.yml" down 2>&1 | tail -2
-    fi
-
+    rm -f "/tmp/wt-dev-webpack-$task-"*".pid"
     grep -v "^$task " "$PORTS_FILE" 2>/dev/null > "${PORTS_FILE}.tmp" || true
     mv "${PORTS_FILE}.tmp" "$PORTS_FILE" 2>/dev/null || true
 
@@ -238,9 +403,9 @@ cmd_dev_stop() {
 # cmd_dev_status — 查看状态
 # ============================================================
 cmd_dev_status() {
-    local task="${1:-}"
+    local task="${1:-}" project=""
     if [[ -z "$task" ]]; then
-        task=$(detect_worktree "" 2>/dev/null || echo "")
+        read -r project task <<< "$(detect_worktree "" 2>/dev/null || echo "")"
     fi
 
     echo "📊 Worktree 开发环境状态"
@@ -249,11 +414,34 @@ cmd_dev_status() {
     if [[ -f "$PORTS_FILE" ]] && [[ -s "$PORTS_FILE" ]]; then
         echo ""
         echo "已分配端口:"
-        while read -r t wp ng ts; do
-            local wp_status="⬇" ng_status="⬇"
-            port_free "$wp" 2>/dev/null && wp_status="✅" || wp_status="🟢"
-            port_free "$ng" 2>/dev/null && ng_status="✅" || ng_status="🟢"
-            printf "  %-25s  webpack: %s (%s)  nginx: %s (%s)\n" "$t" "$wp" "$wp_status" "$ng" "$ng_status"
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            local cols; cols=$(echo "$line" | awk '{print NF}')
+
+            if [[ "$cols" -le 4 ]]; then
+                # 旧格式
+                local t; t=$(echo "$line" | awk '{print $1}')
+                if [[ -n "$task" ]] && [[ "$t" != "$task" ]]; then continue; fi
+                local wp; wp=$(echo "$line" | awk '{print $2}')
+                local ng; ng=$(echo "$line" | awk '{print $3}')
+                local ws="⬇" ns="⬇"
+                port_free "$wp" 2>/dev/null && ws="✅" || ws="🟢"
+                port_free "$ng" 2>/dev/null && ns="✅" || ns="🟢"
+                printf "  %-25s  webpack: %s (%s)  nginx: %s (%s) [旧]\n" "$t" "$wp" "$ws" "$ng" "$ns"
+            else
+                # 新格式
+                local t; t=$(echo "$line" | awk '{print $1}')
+                if [[ -n "$task" ]] && [[ "$t" != "$task" ]]; then continue; fi
+                local proj; proj=$(echo "$line" | awk '{print $2}')
+                local repo; repo=$(echo "$line" | awk '{print $3}')
+                local stype; stype=$(echo "$line" | awk '{print $4}')
+                local port; port=$(echo "$line" | awk '{print $5}')
+                local pid; pid=$(echo "$line" | awk '{print $6}')
+                local status="⬇"
+                port_free "$port" 2>/dev/null && status="✅" || status="🟢"
+                printf "  %-15s %-15s %-8s %s:%-5s (%s) pid=%-6s\n" \
+                    "$t" "$proj" "$repo" "$stype" "$port" "$status" "$pid"
+            fi
         done < "$PORTS_FILE"
     else
         echo "  无运行中的开发环境"
@@ -261,7 +449,7 @@ cmd_dev_status() {
 
     echo ""
     echo "Docker 容器:"
-    docker ps --filter "name=fa56-php-" --format '  {{.Names}}  {{.Status}}' 2>/dev/null || echo "  (无)"
+    docker ps --format '  {{.Names}}  {{.Status}}' 2>/dev/null || echo "  (无)"
 }
 
 # ============================================================
@@ -291,10 +479,6 @@ case "${1:-}" in
         [[ "${1:-}" == "--help" ]] && usage
         cmd_dev_status "$@"
         ;;
-    --help|-h|help)
-        usage
-        ;;
-    *)
-        usage
-        ;;
+    --help|-h|help) usage ;;
+    *) usage ;;
 esac
